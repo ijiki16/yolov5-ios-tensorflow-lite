@@ -50,17 +50,19 @@ class ModelDataHandler: NSObject {
     let threadCount: Int
     let threadCountLimit = 10
     
-    let threshold: Float = 0.5
-    
     // MARK: Model parameters
     let batchSize = 1
     let inputChannels = 3
-    let inputWidth = 640
-    let inputHeight = 640
+    /// Input size, read from the model's input tensor shape (`[1, height, width, 3]`).
+    let inputWidth: Int
+    let inputHeight: Int
+    /// Output layout, read from the model's output tensor shape (`[1, rows, columns]`).
+    private let outputRows: Int
+    private let outputColumns: Int
     
-    // image mean and std for floating model, should be consistent with parameters used in model training
-    let imageMean: Float = 127.5
-    let imageStd:  Float = 127.5
+    // Image mean and std for floating models. YOLOv5 TFLite exports expect pixels scaled to [0, 1].
+    let imageMean: Float = 0
+    let imageStd:  Float = 255
     
     // MARK: Private properties
     private var labels: [String] = []
@@ -104,20 +106,43 @@ class ModelDataHandler: NSObject {
         self.threadCount = threadCount
         var options = Interpreter.Options()
         options.threadCount = threadCount
+        let inputDimensions: [Int]
+        let outputDimensions: [Int]
         do {
             // Create the `Interpreter`.
             interpreter = try Interpreter(modelPath: modelPath, options: options)
             // Allocate memory for the model's input `Tensor`s.
             try interpreter.allocateTensors()
+            inputDimensions = try interpreter.input(at: 0).shape.dimensions
+            outputDimensions = try interpreter.output(at: 0).shape.dimensions
         } catch let error {
             print("Failed to create the interpreter with error: \(error.localizedDescription)")
             return nil
         }
         
+        // Expect NHWC input `[1, height, width, 3]` and output `[1, rows, 5 + classCount]`.
+        guard inputDimensions.count == 4, inputDimensions[0] == batchSize, inputDimensions[3] == inputChannels,
+              outputDimensions.count == 3, outputDimensions[0] == batchSize,
+              outputDimensions[2] > PrePostProcessor.boxValueCount else {
+            print("Unexpected model shapes: input \(inputDimensions), output \(outputDimensions).")
+            return nil
+        }
+        inputHeight = inputDimensions[1]
+        inputWidth = inputDimensions[2]
+        outputRows = outputDimensions[1]
+        outputColumns = outputDimensions[2]
+        
         super.init()
         
         // Load the classes listed in the labels file.
         loadLabels(fileInfo: labelsFileInfo)
+        
+        // Every class the model can predict needs a label.
+        guard labels.count >= outputColumns - PrePostProcessor.boxValueCount else {
+            print("Model predicts \(outputColumns - PrePostProcessor.boxValueCount) classes but only " +
+                  "\(labels.count) labels were loaded.")
+            return nil
+        }
     }
     
     /// This class handles all data preprocessing and makes calls to run inference on a given frame
@@ -126,18 +151,11 @@ class ModelDataHandler: NSObject {
     func runModel(onFrame pixelBuffer: CVPixelBuffer) -> Result? {
         let imageWidth = CVPixelBufferGetWidth(pixelBuffer)
         let imageHeight = CVPixelBufferGetHeight(pixelBuffer)
-        let sourcePixelFormat = CVPixelBufferGetPixelFormatType(pixelBuffer)
-        assert(sourcePixelFormat == kCVPixelFormatType_32ARGB ||
-               sourcePixelFormat == kCVPixelFormatType_32BGRA ||
-               sourcePixelFormat == kCVPixelFormatType_32RGBA)
         
-        
-        let imageChannels = 4
-        assert(imageChannels >= inputChannels)
-        
-        // Crops the image to the biggest square in the center and scales it down to model dimensions.
-        let scaledSize = CGSize(width: inputWidth, height: inputHeight)
-        guard let scaledPixelBuffer = pixelBuffer.resized(to: scaledSize) else {
+        // Scales the image to fit the model input without distorting it, padding the remainder.
+        let inputSize = CGSize(width: inputWidth, height: inputHeight)
+        guard let (scaledPixelBuffer, letterbox) = pixelBuffer.letterboxed(to: inputSize) else {
+            print("Failed to resize the frame; only 32BGRA and 32ARGB pixel buffers are supported.")
             return nil
         }
         
@@ -171,9 +189,15 @@ class ModelDataHandler: NSObject {
             return nil
         }
         
-        let outputs = ([Float](unsafeData: outputResult.data) ?? []) as [NSNumber]
+        guard let outputs = [Float](unsafeData: outputResult.data), outputs.count >= outputRows * outputColumns else {
+            print("Unexpected output tensor size.")
+            return nil
+        }
 
-        let nmsPredictions = PrePostProcessor.outputsToNMSPredictions(outputs: outputs, imageWidth: CGFloat(imageWidth), imageHeight: CGFloat(imageHeight))
+        let nmsPredictions = PrePostProcessor.outputsToNMSPredictions(
+            outputs: outputs, rows: outputRows, columns: outputColumns,
+            inputSize: inputSize, letterbox: letterbox,
+            imageWidth: CGFloat(imageWidth), imageHeight: CGFloat(imageHeight))
 
         var inference: [Inference] = []
         for prediction in nmsPredictions {
@@ -183,55 +207,6 @@ class ModelDataHandler: NSObject {
         let result = Result(inferenceTime: interval, inferences: inference)
 
         return result
-    }
-    
-    /// Filters out all the results with confidence score < threshold and returns the top N results
-    /// sorted in descending order.
-    func formatResults(boundingBox: [Float], outputClasses: [Float], outputScores: [Float], outputCount: Int, width: CGFloat, height: CGFloat) -> [Inference]{
-        var resultsArray: [Inference] = []
-        if (outputCount == 0) {
-            return resultsArray
-        }
-        for i in 0...outputCount - 1 {
-            
-            let score = outputScores[i]
-            
-            // Filters results with confidence < threshold.
-            guard score >= threshold else {
-                continue
-            }
-            
-            // Gets the output class names for detected classes from labels list.
-            let outputClassIndex = Int(outputClasses[i])
-            let outputClass = labels[outputClassIndex + 1]
-            
-            var rect: CGRect = CGRect.zero
-            
-            // Translates the detected bounding box to CGRect.
-            rect.origin.y = CGFloat(boundingBox[4*i])
-            rect.origin.x = CGFloat(boundingBox[4*i+1])
-            rect.size.height = CGFloat(boundingBox[4*i+2]) - rect.origin.y
-            rect.size.width = CGFloat(boundingBox[4*i+3]) - rect.origin.x
-            
-            // The detected corners are for model dimensions. So we scale the rect with respect to the
-            // actual image dimensions.
-            let newRect = rect.applying(CGAffineTransform(scaleX: width, y: height))
-            
-            // Gets the color assigned for the class
-            let colorToAssign = colorForClass(withIndex: outputClassIndex + 1)
-            let inference = Inference(confidence: score,
-                                      className: outputClass,
-                                      rect: newRect,
-                                      displayColor: colorToAssign)
-            resultsArray.append(inference)
-        }
-        
-        // Sort results in descending order of confidence.
-        resultsArray.sort { (first, second) -> Bool in
-            return first.confidence  > second.confidence
-        }
-        
-        return resultsArray
     }
     
     /// Loads the labels from the labels file and stores them in the `labels` property.

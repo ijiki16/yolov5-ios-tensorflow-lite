@@ -9,16 +9,15 @@ struct Prediction {
 }
 
 class PrePostProcessor : NSObject {
-    // 모델 입력 이미지 크기
-    static let inputWidth = 640
-    static let inputHeight = 640
+    /// Minimum `objectness * class score` for a candidate box to be kept (YOLOv5's default is 0.25).
+    static let confidenceThreshold: Float = 0.25
+    /// Boxes of the same class overlapping a higher-scoring box by more than this IoU are suppressed.
+    static let iouThreshold: Float = 0.45
+    /// Maximum number of detections returned per frame.
+    static let nmsLimit = 100
+    /// Number of values preceding the class scores in each output row: x, y, w, h and objectness.
+    static let boxValueCount = 5
 
-    // model output is of size 25200*85  10668
-    static let outputRow = 25200 // YOLOv5 모델 input size 640 * 640 기준 output Row 값 25200
-    static let outputColumn = 85 // 클래스 수 + 5 (left, top, right, bottom, score) 값
-    static let threshold : Float = 0.35 // 객체 탐지를 진행하는 최소한의 임계값 35%
-    static let nmsLimit = 100 // 최대 탐지 개수
-    
     // The two methods nonMaxSuppression and IOU below are from  https://github.com/hollance/YOLO-CoreML-MPSNNGraph/blob/master/Common/Helpers.swift
     /**
       Removes bounding boxes that overlap too much with other boxes that have
@@ -81,39 +80,78 @@ class PrePostProcessor : NSObject {
       return Float(intersectionArea / (areaA + areaB - intersectionArea))
     }
 
-    static func outputsToNMSPredictions(outputs: [NSNumber], imageWidth: CGFloat, imageHeight: CGFloat) -> [Prediction] {
-        var predictions = [Prediction]()
-        for i in 0..<outputRow {
-            if Float(truncating: outputs[i*outputColumn+4]) > threshold {
-                let x = Double(truncating: outputs[i*outputColumn])
-                let y = Double(truncating: outputs[i*outputColumn+1])
-                let w = Double(truncating: outputs[i*outputColumn+2])
-                let h = Double(truncating: outputs[i*outputColumn+3])
-                
-                let left = (x - w/2)
-                let top = (y - h/2)
-                let right = (x + w/2)
-                let bottom = (y + h/2)
-                
-                var max = Double(truncating: outputs[i*outputColumn+5])
-                var cls = 0
-                for j in 0 ..< outputColumn-5 {
-                    if Double(truncating: outputs[i*outputColumn+5+j]) > max {
-                        max = Double(truncating: outputs[i*outputColumn+5+j])
-                        cls = j
-                    }
-                }
+    /// Runs NMS separately for each class so that overlapping objects of different classes do not
+    /// suppress each other, then returns the best `limit` boxes overall.
+    static func perClassNonMaxSuppression(boxes: [Prediction], limit: Int, threshold: Float) -> [Prediction] {
+        let byClass = Dictionary(grouping: boxes, by: { $0.classIndex })
+        var selected = [Prediction]()
+        for (_, classBoxes) in byClass {
+            selected += nonMaxSuppression(boxes: classBoxes, limit: limit, threshold: threshold)
+        }
+        selected.sort { $0.score > $1.score }
+        return Array(selected.prefix(limit))
+    }
 
-                let rect = CGRect(x: left, y: top, width: right-left, height: bottom-top).applying(CGAffineTransform(scaleX: CGFloat(imageWidth), y: CGFloat(imageHeight)))
-                
-                
-                //output 값은 outputs[i * (클래스 수 + 5) + 4]
-                let prediction = Prediction(classIndex: cls, score: Float(truncating: outputs[i*outputColumn+4]), rect: rect)
-                predictions.append(prediction)
+    /// Decodes the raw YOLOv5 output into predictions expressed in source-image pixels.
+    ///
+    /// - Parameters:
+    ///   - outputs: Flattened `[rows x columns]` output tensor. Each row is
+    ///       `x, y, w, h, objectness, class scores...`, with the box normalised to the model input.
+    ///   - rows: Number of candidate boxes in the output.
+    ///   - columns: Number of values per candidate (`boxValueCount` + number of classes).
+    ///   - inputSize: Size of the model input the frame was letterboxed into.
+    ///   - letterbox: Scale and padding that were applied to fit the frame into the model input.
+    ///   - imageWidth: Width of the original frame in pixels.
+    ///   - imageHeight: Height of the original frame in pixels.
+    static func outputsToNMSPredictions(outputs: [Float], rows: Int, columns: Int,
+                                        inputSize: CGSize, letterbox: Letterbox,
+                                        imageWidth: CGFloat, imageHeight: CGFloat) -> [Prediction] {
+        let classCount = columns - boxValueCount
+        guard classCount > 0, rows > 0, outputs.count >= rows * columns else { return [] }
+
+        var predictions = [Prediction]()
+        for i in 0..<rows {
+            let base = i * columns
+            let objectness = outputs[base + 4]
+            // Cheap early-out: the combined score can never exceed the objectness.
+            guard objectness > confidenceThreshold else { continue }
+
+            var bestClassScore = outputs[base + boxValueCount]
+            var cls = 0
+            for j in 1..<max(classCount, 1) {
+                let classScore = outputs[base + boxValueCount + j]
+                if classScore > bestClassScore {
+                    bestClassScore = classScore
+                    cls = j
+                }
             }
+
+            let score = objectness * bestClassScore
+            guard score >= confidenceThreshold else { continue }
+
+            // Normalised centre/size -> model-input pixels -> source-image pixels (undoing the letterbox).
+            let x = CGFloat(outputs[base]) * inputSize.width
+            let y = CGFloat(outputs[base + 1]) * inputSize.height
+            let w = CGFloat(outputs[base + 2]) * inputSize.width
+            let h = CGFloat(outputs[base + 3]) * inputSize.height
+
+            let left = ((x - w / 2) - letterbox.padX) / letterbox.scale
+            let top = ((y - h / 2) - letterbox.padY) / letterbox.scale
+            let right = ((x + w / 2) - letterbox.padX) / letterbox.scale
+            let bottom = ((y + h / 2) - letterbox.padY) / letterbox.scale
+
+            let clampedLeft = min(max(left, 0), imageWidth)
+            let clampedTop = min(max(top, 0), imageHeight)
+            let clampedRight = min(max(right, 0), imageWidth)
+            let clampedBottom = min(max(bottom, 0), imageHeight)
+            guard clampedRight > clampedLeft, clampedBottom > clampedTop else { continue }
+
+            let rect = CGRect(x: clampedLeft, y: clampedTop,
+                              width: clampedRight - clampedLeft, height: clampedBottom - clampedTop)
+            predictions.append(Prediction(classIndex: cls, score: score, rect: rect))
         }
 
-        return nonMaxSuppression(boxes: predictions, limit: nmsLimit, threshold: threshold)
+        return perClassNonMaxSuppression(boxes: predictions, limit: nmsLimit, threshold: iouThreshold)
     }
 
     static func cleanDetection(imageView: UIImageView) {

@@ -33,14 +33,23 @@ class ViewController: UIViewController {
   private let animationDuration = 0.5
   private let collapseTransitionThreshold: CGFloat = -30.0
   private let expandTransitionThreshold: CGFloat = 30.0
-  private let delayBetweenInferencesMs: Double = 200
+  /// Minimum time between the start of two inferences, measured with the monotonic media clock.
+  private let delayBetweenInferences: CFTimeInterval = 0.2
 
   // MARK: Instance Variables
   private var initialBottomSpace: CGFloat = 0.0
 
-  // Holds the results at any time
+  // Holds the latest result. Only accessed on the main thread.
   private var result: Result?
-  private var previousInferenceTimeMs: TimeInterval = Date.distantPast.timeIntervalSince1970 * 1000
+
+  // MARK: Inference threading
+  // The TensorFlow Lite `Interpreter` is not thread safe, so every use of `modelDataHandler` after
+  // the view has loaded happens on `inferenceQueue`. The semaphore allows a single frame in flight;
+  // frames that arrive while it is taken are dropped rather than queued.
+  private let inferenceQueue = DispatchQueue(label: "inferenceQueue", qos: .userInitiated)
+  private let inferenceSlot = DispatchSemaphore(value: 1)
+  // Only accessed from `didOutput`, which is always called on the camera's single sample buffer queue.
+  private var previousInferenceStartTime: CFTimeInterval = 0
 
   // MARK: Controllers that manage functionality
   private lazy var cameraFeedManager = CameraFeedManager(previewView: previewView)
@@ -114,6 +123,8 @@ class ViewController: UIViewController {
 
     if segue.identifier == "EMBED" {
 
+      // Safe to read here: this runs while the storyboard loads, before the camera (and so any
+      // access from `inferenceQueue`) has started.
       guard let tempModelDataHandler = modelDataHandler else {
         return
       }
@@ -137,12 +148,20 @@ class ViewController: UIViewController {
 extension ViewController: InferenceViewControllerDelegate {
 
   func didChangeThreadCount(to count: Int) {
-    if modelDataHandler?.threadCount == count { return }
-    modelDataHandler = ModelDataHandler(
-      modelFileInfo: Yolov5.modelInfo,
-      labelsFileInfo: Yolov5.labelsInfo,
-      threadCount: count
-    )
+    // Swap the handler on the inference queue so an in-flight inference is never interrupted.
+    inferenceQueue.async {
+      if self.modelDataHandler?.threadCount == count { return }
+      // Keep using the current handler if the new one cannot be created.
+      guard let newHandler = ModelDataHandler(
+        modelFileInfo: Yolov5.modelInfo,
+        labelsFileInfo: Yolov5.labelsInfo,
+        threadCount: count
+      ) else {
+        print("Failed to change the thread count to \(count); keeping the current model.")
+        return
+      }
+      self.modelDataHandler = newHandler
+    }
   }
 
 }
@@ -214,38 +233,38 @@ extension ViewController: CameraFeedManagerDelegate {
    */
   @objc  func runModel(onPixelBuffer pixelBuffer: CVPixelBuffer) {
 
-    // Run the live camera pixelBuffer through tensorFlow to get the result
-
-    let currentTimeMs = Date().timeIntervalSince1970 * 1000
-
-    guard  (currentTimeMs - previousInferenceTimeMs) >= delayBetweenInferencesMs else {
+    let now = CACurrentMediaTime()
+    guard (now - previousInferenceStartTime) >= delayBetweenInferences else {
       return
     }
 
-    previousInferenceTimeMs = currentTimeMs
-    result = self.modelDataHandler?.runModel(onFrame: pixelBuffer)
-
-    guard let displayResult = result else {
+    // Drop the frame if the previous one is still being processed.
+    guard inferenceSlot.wait(timeout: .now()) == .success else {
       return
     }
+    previousInferenceStartTime = now
 
-    let width = CVPixelBufferGetWidth(pixelBuffer)
-    let height = CVPixelBufferGetHeight(pixelBuffer)
+    inferenceQueue.async {
+      defer { self.inferenceSlot.signal() }
 
-    DispatchQueue.main.async {
-
-      // Display results by handing off to the InferenceViewController
-      self.inferenceViewController?.resolution = CGSize(width: width, height: height)
-
-      var inferenceTime: Double = 0
-      if let resultInferenceTime = self.result?.inferenceTime {
-        inferenceTime = resultInferenceTime
+      guard let displayResult = self.modelDataHandler?.runModel(onFrame: pixelBuffer) else {
+        return
       }
-      self.inferenceViewController?.inferenceTime = inferenceTime
-      self.inferenceViewController?.tableView.reloadData()
 
-      // Draws the bounding boxes and displays class names and confidence scores.
-      self.drawAfterPerformingCalculations(onInferences: displayResult.inferences, withImageSize: CGSize(width: CGFloat(width), height: CGFloat(height)))
+      let width = CVPixelBufferGetWidth(pixelBuffer)
+      let height = CVPixelBufferGetHeight(pixelBuffer)
+
+      DispatchQueue.main.async {
+        self.result = displayResult
+
+        // Display results by handing off to the InferenceViewController
+        self.inferenceViewController?.resolution = CGSize(width: width, height: height)
+        self.inferenceViewController?.inferenceTime = displayResult.inferenceTime
+        self.inferenceViewController?.tableView.reloadData()
+
+        // Draws the bounding boxes and displays class names and confidence scores.
+        self.drawAfterPerformingCalculations(onInferences: displayResult.inferences, withImageSize: CGSize(width: CGFloat(width), height: CGFloat(height)))
+      }
     }
   }
 

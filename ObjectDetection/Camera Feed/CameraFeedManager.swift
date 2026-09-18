@@ -82,7 +82,8 @@ class CameraFeedManager: NSObject {
     super.init()
 
     // Initializes the session
-    session.sessionPreset = .high
+    // 720p is plenty for a 640x640 model input; larger frames only add scaling work.
+    session.sessionPreset = .hd1280x720
     self.previewView.session = session
     self.previewView.previewLayer.connection?.videoOrientation = .portrait
     self.previewView.previewLayer.videoGravity = .resizeAspectFill
@@ -250,7 +251,7 @@ class CameraFeedManager: NSObject {
     let sampleBufferQueue = DispatchQueue(label: "sampleBufferQueue")
     videoDataOutput.setSampleBufferDelegate(self, queue: sampleBufferQueue)
     videoDataOutput.alwaysDiscardsLateVideoFrames = true
-    videoDataOutput.videoSettings = [ String(kCVPixelBufferPixelFormatTypeKey) : kCMPixelFormat_32BGRA]
+    videoDataOutput.videoSettings = [ String(kCVPixelBufferPixelFormatTypeKey) : kCVPixelFormatType_32BGRA]
 
     if session.canAddOutput(videoDataOutput) {
       session.addOutput(videoDataOutput)

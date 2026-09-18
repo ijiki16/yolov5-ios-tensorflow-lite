@@ -103,7 +103,7 @@ class PrePostProcessor : NSObject {
     ///   - letterbox: Scale and padding that were applied to fit the frame into the model input.
     ///   - imageWidth: Width of the original frame in pixels.
     ///   - imageHeight: Height of the original frame in pixels.
-    static func outputsToNMSPredictions(outputs: [Float], rows: Int, columns: Int,
+    static func outputsToNMSPredictions(outputs: UnsafeBufferPointer<Float>, rows: Int, columns: Int,
                                         inputSize: CGSize, letterbox: Letterbox,
                                         imageWidth: CGFloat, imageHeight: CGFloat) -> [Prediction] {
         let classCount = columns - boxValueCount

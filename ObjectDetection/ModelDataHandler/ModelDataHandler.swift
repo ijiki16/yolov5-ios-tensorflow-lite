@@ -179,9 +179,9 @@ class ModelDataHandler: NSObject {
             try interpreter.copy(rgbData, toInputAt: 0)
             
             // Run inference by invoking the `Interpreter`.
-            let startDate = Date()
+            let startTime = CACurrentMediaTime()
             try interpreter.invoke()
-            interval = Date().timeIntervalSince(startDate) * 1000
+            interval = (CACurrentMediaTime() - startTime) * 1000
             
             outputResult = try interpreter.output(at: 0)
         } catch let error {
@@ -189,15 +189,19 @@ class ModelDataHandler: NSObject {
             return nil
         }
         
-        guard let outputs = [Float](unsafeData: outputResult.data), outputs.count >= outputRows * outputColumns else {
+        // Decode straight from the tensor's bytes to avoid copying ~2M floats into an array.
+        let outputData = outputResult.data
+        let expectedByteCount = outputRows * outputColumns * MemoryLayout<Float>.stride
+        guard outputData.count >= expectedByteCount else {
             print("Unexpected output tensor size.")
             return nil
         }
-
-        let nmsPredictions = PrePostProcessor.outputsToNMSPredictions(
-            outputs: outputs, rows: outputRows, columns: outputColumns,
-            inputSize: inputSize, letterbox: letterbox,
-            imageWidth: CGFloat(imageWidth), imageHeight: CGFloat(imageHeight))
+        let nmsPredictions = outputData.withUnsafeBytes { rawBuffer in
+            PrePostProcessor.outputsToNMSPredictions(
+                outputs: rawBuffer.bindMemory(to: Float.self), rows: outputRows, columns: outputColumns,
+                inputSize: inputSize, letterbox: letterbox,
+                imageWidth: CGFloat(imageWidth), imageHeight: CGFloat(imageHeight))
+        }
 
         var inference: [Inference] = []
         for prediction in nmsPredictions {
@@ -280,16 +284,20 @@ class ModelDataHandler: NSObject {
             vImageConvert_ARGB8888toRGB888(&sourceBuffer, &destinationBuffer, UInt32(kvImageNoFlags))
         }
         
-        let byteData = Data(bytes: destinationBuffer.data, count: destinationBuffer.rowBytes * height)
+        let byteCount = destinationBuffer.rowBytes * height
         if isModelQuantized {
-            return byteData
+            return Data(bytes: destinationData, count: byteCount)
         }
         
-        // Not quantized, convert to floats
-        let bytes = Array<UInt8>(unsafeData: byteData)!
-        var floats = [Float]()
-        for i in 0..<bytes.count {
-            floats.append((Float(bytes[i]) - imageMean) / imageStd)
+        // Not quantized: convert to floats and normalise as `(x - mean) / std` using vDSP.
+        var floats = [Float](repeating: 0, count: byteCount)
+        var scale = 1 / imageStd
+        var offset = -imageMean / imageStd
+        floats.withUnsafeMutableBufferPointer { floatBuffer in
+            guard let floatBase = floatBuffer.baseAddress else { return }
+            vDSP_vfltu8(destinationData.assumingMemoryBound(to: UInt8.self), 1,
+                        floatBase, 1, vDSP_Length(byteCount))
+            vDSP_vsmsa(floatBase, 1, &scale, &offset, floatBase, 1, vDSP_Length(byteCount))
         }
         return Data(copyingBufferOf: floats)
     }

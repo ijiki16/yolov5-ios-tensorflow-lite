@@ -6,6 +6,7 @@ target 'ObjectDetection' do
   use_frameworks!
 
   # Pods for ObjectDetection
-  pod 'TensorFlowLiteSwift', "~> 2.3.0"
+  # The Metal subspec adds `MetalDelegate` for GPU acceleration.
+  pod 'TensorFlowLiteSwift', "~> 2.17.0", :subspecs => ['Metal']
 
 end

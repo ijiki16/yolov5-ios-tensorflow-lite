@@ -46,9 +46,11 @@ enum Yolov5 {
 class ModelDataHandler: NSObject {
     
     // MARK: - Internal Properties
-    /// The current thread count used by the TensorFlow Lite Interpreter.
+    /// The current thread count used by the TensorFlow Lite Interpreter when running on the CPU.
     let threadCount: Int
     let threadCountLimit = 10
+    /// Whether inference runs on the GPU through the Metal delegate (otherwise on the CPU).
+    let isUsingGPU: Bool
     
     // MARK: Model parameters
     let batchSize = 1
@@ -90,7 +92,10 @@ class ModelDataHandler: NSObject {
     
     /// A failable initializer for `ModelDataHandler`. A new instance is created if the model and
     /// labels files are successfully loaded from the app's main bundle. Default `threadCount` is 1.
-    init?(modelFileInfo: FileInfo, labelsFileInfo: FileInfo, threadCount: Int = 1) {
+    ///
+    /// When `useGPU` is true the Metal delegate is tried first, falling back to the CPU if it cannot
+    /// be created; `threadCount` then only matters for the CPU path.
+    init?(modelFileInfo: FileInfo, labelsFileInfo: FileInfo, threadCount: Int = 1, useGPU: Bool = true) {
         let modelFilename = modelFileInfo.name
         
         // Construct the path to the model file.
@@ -102,17 +107,13 @@ class ModelDataHandler: NSObject {
             return nil
         }
         
-        // Specify the options for the `Interpreter`.
         self.threadCount = threadCount
-        var options = Interpreter.Options()
-        options.threadCount = threadCount
         let inputDimensions: [Int]
         let outputDimensions: [Int]
         do {
-            // Create the `Interpreter`.
-            interpreter = try Interpreter(modelPath: modelPath, options: options)
-            // Allocate memory for the model's input `Tensor`s.
-            try interpreter.allocateTensors()
+            // Create the `Interpreter` (on the GPU if possible) and allocate the model's tensors.
+            (interpreter, isUsingGPU) = try ModelDataHandler.makeInterpreter(
+                modelPath: modelPath, threadCount: threadCount, useGPU: useGPU)
             inputDimensions = try interpreter.input(at: 0).shape.dimensions
             outputDimensions = try interpreter.output(at: 0).shape.dimensions
         } catch let error {
@@ -145,6 +146,31 @@ class ModelDataHandler: NSObject {
         }
     }
     
+    /// Creates an interpreter with its tensors allocated. If `useGPU` is true, the Metal delegate is
+    /// tried first; any failure to set it up falls back to a CPU interpreter.
+    /// - Returns: The interpreter and whether it is using the GPU.
+    private static func makeInterpreter(modelPath: String, threadCount: Int, useGPU: Bool) throws
+        -> (Interpreter, Bool) {
+        if useGPU {
+            do {
+                var metalOptions = MetalDelegate.Options()
+                // fp16 precision is what the GPU is fastest at, and is plenty for detection.
+                metalOptions.isPrecisionLossAllowed = true
+                let interpreter = try Interpreter(modelPath: modelPath, delegates: [MetalDelegate(options: metalOptions)])
+                try interpreter.allocateTensors()
+                return (interpreter, true)
+            } catch let error {
+                print("Metal delegate unavailable, falling back to the CPU: \(error.localizedDescription)")
+            }
+        }
+
+        var options = Interpreter.Options()
+        options.threadCount = threadCount
+        let interpreter = try Interpreter(modelPath: modelPath, options: options)
+        try interpreter.allocateTensors()
+        return (interpreter, false)
+    }
+
     /// This class handles all data preprocessing and makes calls to run inference on a given frame
     /// through the `Interpreter`. It then formats the inferences obtained and returns the top N
     /// results for a successful inference.

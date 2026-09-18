@@ -18,7 +18,7 @@ import UIKit
 import Accelerate
 
 /// Stores results for a particular frame that was successfully run through the `Interpreter`.
-struct Result {
+struct InferenceResult {
     let inferenceTime: Double
     let inferences: [Inference]
 }
@@ -34,9 +34,14 @@ struct Inference {
 /// Information about a model file or labels file.
 typealias FileInfo = (name: String, extension: String)
 
-/// Information about the MobileNet SSD model.
+/// Information about the bundled YOLOv5 models and their labels.
 enum Yolov5 {
-    static let modelInfo: FileInfo = (name: "yolov5s-fp16", extension: "tflite")
+    /// Small model: more accurate, slower.
+    static let smallModelInfo: FileInfo = (name: "yolov5s-fp16", extension: "tflite")
+    /// Nano model: less accurate, faster.
+    static let nanoModelInfo: FileInfo = (name: "yolov5n-fp16", extension: "tflite")
+    /// The model the app runs. Switch to `nanoModelInfo` for a lighter model.
+    static let modelInfo: FileInfo = smallModelInfo
     static let labelsInfo: FileInfo = (name: "classes", extension: "txt")
 }
 
@@ -72,8 +77,6 @@ class ModelDataHandler: NSObject {
     /// TensorFlow Lite `Interpreter` object for performing inference on a given model.
     private var interpreter: Interpreter
     
-    private let bgraPixel = (channels: 4, alphaComponent: 3, lastBgrComponent: 2)
-    private let rgbPixelChannels = 3
     private let colorStrideValue = 10
     private let colors = [
         UIColor.red,
@@ -103,7 +106,7 @@ class ModelDataHandler: NSObject {
             forResource: modelFilename,
             ofType: modelFileInfo.extension
         ) else {
-            print("Failed to load the model file with name: \(modelFilename).")
+            Log.error("Failed to load the model file with name: \(modelFilename).")
             return nil
         }
         
@@ -117,7 +120,7 @@ class ModelDataHandler: NSObject {
             inputDimensions = try interpreter.input(at: 0).shape.dimensions
             outputDimensions = try interpreter.output(at: 0).shape.dimensions
         } catch let error {
-            print("Failed to create the interpreter with error: \(error.localizedDescription)")
+            Log.error("Failed to create the interpreter with error: \(error.localizedDescription)")
             return nil
         }
         
@@ -125,7 +128,7 @@ class ModelDataHandler: NSObject {
         guard inputDimensions.count == 4, inputDimensions[0] == batchSize, inputDimensions[3] == inputChannels,
               outputDimensions.count == 3, outputDimensions[0] == batchSize,
               outputDimensions[2] > PrePostProcessor.boxValueCount else {
-            print("Unexpected model shapes: input \(inputDimensions), output \(outputDimensions).")
+            Log.error("Unexpected model shapes: input \(inputDimensions), output \(outputDimensions).")
             return nil
         }
         inputHeight = inputDimensions[1]
@@ -136,11 +139,13 @@ class ModelDataHandler: NSObject {
         super.init()
         
         // Load the classes listed in the labels file.
-        loadLabels(fileInfo: labelsFileInfo)
+        guard loadLabels(fileInfo: labelsFileInfo) else {
+            return nil
+        }
         
         // Every class the model can predict needs a label.
         guard labels.count >= outputColumns - PrePostProcessor.boxValueCount else {
-            print("Model predicts \(outputColumns - PrePostProcessor.boxValueCount) classes but only " +
+            Log.error("Model predicts \(outputColumns - PrePostProcessor.boxValueCount) classes but only " +
                   "\(labels.count) labels were loaded.")
             return nil
         }
@@ -160,7 +165,7 @@ class ModelDataHandler: NSObject {
                 try interpreter.allocateTensors()
                 return (interpreter, true)
             } catch let error {
-                print("Metal delegate unavailable, falling back to the CPU: \(error.localizedDescription)")
+                Log.info("Metal delegate unavailable, falling back to the CPU: \(error.localizedDescription)")
             }
         }
 
@@ -174,14 +179,14 @@ class ModelDataHandler: NSObject {
     /// This class handles all data preprocessing and makes calls to run inference on a given frame
     /// through the `Interpreter`. It then formats the inferences obtained and returns the top N
     /// results for a successful inference.
-    func runModel(onFrame pixelBuffer: CVPixelBuffer) -> Result? {
+    func runModel(onFrame pixelBuffer: CVPixelBuffer) -> InferenceResult? {
         let imageWidth = CVPixelBufferGetWidth(pixelBuffer)
         let imageHeight = CVPixelBufferGetHeight(pixelBuffer)
         
         // Scales the image to fit the model input without distorting it, padding the remainder.
         let inputSize = CGSize(width: inputWidth, height: inputHeight)
         guard let (scaledPixelBuffer, letterbox) = pixelBuffer.letterboxed(to: inputSize) else {
-            print("Failed to resize the frame; only 32BGRA and 32ARGB pixel buffers are supported.")
+            Log.error("Failed to resize the frame; only 32BGRA and 32ARGB pixel buffers are supported.")
             return nil
         }
         
@@ -197,7 +202,7 @@ class ModelDataHandler: NSObject {
                 byteCount: batchSize * inputWidth * inputHeight * inputChannels,
                 isModelQuantized: inputTensor.dataType == .uInt8
             ) else {
-                print("Failed to convert the image buffer to RGB data.")
+                Log.error("Failed to convert the image buffer to RGB data.")
                 return nil
             }
             
@@ -211,7 +216,7 @@ class ModelDataHandler: NSObject {
             
             outputResult = try interpreter.output(at: 0)
         } catch let error {
-            print("Failed to invoke the interpreter with error: \(error.localizedDescription)")
+            Log.error("Failed to invoke the interpreter with error: \(error.localizedDescription)")
             return nil
         }
         
@@ -219,7 +224,7 @@ class ModelDataHandler: NSObject {
         let outputData = outputResult.data
         let expectedByteCount = outputRows * outputColumns * MemoryLayout<Float>.stride
         guard outputData.count >= expectedByteCount else {
-            print("Unexpected output tensor size.")
+            Log.error("Unexpected output tensor size.")
             return nil
         }
         let nmsPredictions = outputData.withUnsafeBytes { rawBuffer in
@@ -234,25 +239,28 @@ class ModelDataHandler: NSObject {
             let pred = Inference(confidence: prediction.score, className: labels[prediction.classIndex], rect: prediction.rect, displayColor: colorForClass(withIndex: prediction.classIndex + 1))
             inference.append(pred)
         }
-        let result = Result(inferenceTime: interval, inferences: inference)
+        let result = InferenceResult(inferenceTime: interval, inferences: inference)
 
         return result
     }
     
     /// Loads the labels from the labels file and stores them in the `labels` property.
-    private func loadLabels(fileInfo: FileInfo) {
+    /// - Returns: `false` if the file is missing or cannot be read.
+    private func loadLabels(fileInfo: FileInfo) -> Bool {
         let filename = fileInfo.name
         let fileExtension = fileInfo.extension
         guard let fileURL = Bundle.main.url(forResource: filename, withExtension: fileExtension) else {
-            fatalError("Labels file not found in bundle. Please add a labels file with name " +
-                       "\(filename).\(fileExtension) and try again.")
+            Log.error("Labels file not found in bundle. Please add a labels file with name " +
+                      "\(filename).\(fileExtension) and try again.")
+            return false
         }
         do {
             let contents = try String(contentsOf: fileURL, encoding: .utf8)
             labels = contents.components(separatedBy: .newlines)
+            return true
         } catch {
-            fatalError("Labels file named \(filename).\(fileExtension) cannot be read. Please add a " +
-                       "valid labels file and try again.")
+            Log.error("Labels file named \(filename).\(fileExtension) cannot be read: \(error.localizedDescription)")
+            return false
         }
     }
     
@@ -291,7 +299,7 @@ class ModelDataHandler: NSObject {
                                          rowBytes: sourceBytesPerRow)
         
         guard let destinationData = malloc(height * destinationBytesPerRow) else {
-            print("Error: out of memory")
+            Log.error("Error: out of memory")
             return nil
         }
         

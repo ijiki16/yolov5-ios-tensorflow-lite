@@ -154,37 +154,4 @@ class PrePostProcessor : NSObject {
         return perClassNonMaxSuppression(boxes: predictions, limit: nmsLimit, threshold: iouThreshold)
     }
 
-    static func cleanDetection(imageView: UIImageView) {
-        if let layers = imageView.layer.sublayers {
-            for layer in layers {
-                if layer is CATextLayer {
-                    layer.removeFromSuperlayer()
-                }
-            }
-            for view in imageView.subviews {
-                view.removeFromSuperview()
-            }
-        }
-    }
-
-    static func showDetection(imageView: UIImageView, nmsPredictions: [Prediction], classes: [String]) {
-        
-        for pred in nmsPredictions {
-            let bbox = UIView(frame: pred.rect)
-            bbox.backgroundColor = UIColor.clear
-            bbox.layer.borderColor = UIColor.yellow.cgColor
-            bbox.layer.borderWidth = 2
-            imageView.addSubview(bbox)
-            
-            let textLayer = CATextLayer()
-            textLayer.string = String(format: " %@ %.2f", classes[pred.classIndex], pred.score)
-            textLayer.foregroundColor = UIColor.white.cgColor
-            textLayer.backgroundColor = UIColor.magenta.cgColor
-            textLayer.fontSize = 14
-            textLayer.frame = CGRect(x: pred.rect.origin.x, y: pred.rect.origin.y, width:100, height:20)
-            imageView.layer.addSublayer(textLayer)
-            
-        }
-    }
-
 }

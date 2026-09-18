@@ -16,7 +16,7 @@ import UIKit
 import AVFoundation
 
 // MARK: CameraFeedManagerDelegate Declaration
-protocol CameraFeedManagerDelegate: class {
+protocol CameraFeedManagerDelegate: AnyObject {
 
   /**
    This method delivers the pixel buffer of the current frame seen by the device's camera.
@@ -162,7 +162,7 @@ class CameraFeedManager: NSObject {
       self.requestCameraAccess(completion: { (granted) in
         self.sessionQueue.resume()
       })
-    case .denied:
+    case .denied, .restricted:
       self.cameraConfiguration = .permissionDenied
     default:
       break
@@ -225,7 +225,9 @@ class CameraFeedManager: NSObject {
     /**Tries to get the default back camera.
      */
     guard let camera  = AVCaptureDevice.default(.builtInWideAngleCamera, for: .video, position: .back) else {
-      fatalError("Cannot find camera")
+      // For example on the Simulator; the delegate shows the "Configuration Failed" alert.
+      Log.error("Cannot find camera")
+      return false
     }
 
     do {
@@ -239,7 +241,8 @@ class CameraFeedManager: NSObject {
       }
     }
     catch {
-      fatalError("Cannot create video device input")
+      Log.error("Cannot create video device input: \(error.localizedDescription)")
+      return false
     }
   }
 
@@ -280,7 +283,7 @@ class CameraFeedManager: NSObject {
     if let userInfoValue = notification.userInfo?[AVCaptureSessionInterruptionReasonKey] as AnyObject?,
       let reasonIntegerValue = userInfoValue.integerValue,
       let reason = AVCaptureSession.InterruptionReason(rawValue: reasonIntegerValue) {
-      print("Capture session was interrupted with reason \(reason)")
+      Log.info("Capture session was interrupted with reason \(reason)")
 
       var canResumeManually = false
       if reason == .videoDeviceInUseByAnotherClient {
@@ -304,7 +307,7 @@ class CameraFeedManager: NSObject {
       return
     }
 
-    print("Capture session runtime error: \(error)")
+    Log.error("Capture session runtime error: \(error)")
 
     if error.code == .mediaServicesWereReset {
       sessionQueue.async {

@@ -40,7 +40,7 @@ class ViewController: UIViewController {
   private var initialBottomSpace: CGFloat = 0.0
 
   // Holds the latest result. Only accessed on the main thread.
-  private var result: Result?
+  private var result: InferenceResult?
 
   // MARK: Inference threading
   // The TensorFlow Lite `Interpreter` is not thread safe, so every use of `modelDataHandler` after
@@ -62,7 +62,9 @@ class ViewController: UIViewController {
     super.viewDidLoad()
 
     guard modelDataHandler != nil else {
-      fatalError("Failed to load model")
+      // Handled in `viewDidAppear`, where an alert can be presented.
+      Log.error("Failed to load model")
+      return
     }
     cameraFeedManager.delegate = self
     overlayView.clearsContextBeforeDrawing = true
@@ -77,13 +79,21 @@ class ViewController: UIViewController {
 
   override func viewWillAppear(_ animated: Bool) {
     super.viewWillAppear(animated)
+    guard modelDataHandler != nil else { return }
     changeBottomViewState()
     cameraFeedManager.checkCameraConfigurationAndStartSession()
   }
 
+  override func viewDidAppear(_ animated: Bool) {
+    super.viewDidAppear(animated)
+    if modelDataHandler == nil {
+      presentModelLoadFailureAlert()
+    }
+  }
+
   override func viewWillDisappear(_ animated: Bool) {
     super.viewWillDisappear(animated)
-
+    guard modelDataHandler != nil else { return }
     cameraFeedManager.stopSession()
   }
 
@@ -104,6 +114,17 @@ class ViewController: UIViewController {
         self.presentUnableToResumeSessionAlert()
       }
     }
+  }
+
+  func presentModelLoadFailureAlert() {
+    let alert = UIAlertController(
+      title: "Model Failed to Load",
+      message: "The detection model could not be loaded, so object detection is unavailable.",
+      preferredStyle: .alert
+    )
+    alert.addAction(UIAlertAction(title: "OK", style: .default, handler: nil))
+
+    present(alert, animated: true)
   }
 
   func presentUnableToResumeSessionAlert() {
@@ -157,7 +178,7 @@ extension ViewController: InferenceViewControllerDelegate {
         labelsFileInfo: Yolov5.labelsInfo,
         threadCount: count
       ) else {
-        print("Failed to change the thread count to \(count); keeping the current model.")
+        Log.error("Failed to change the thread count to \(count); keeping the current model.")
         return
       }
       self.modelDataHandler = newHandler
@@ -219,7 +240,8 @@ extension ViewController: CameraFeedManagerDelegate {
     let cancelAction = UIAlertAction(title: "Cancel", style: .cancel, handler: nil)
     let settingsAction = UIAlertAction(title: "Settings", style: .default) { (action) in
 
-      UIApplication.shared.open(URL(string: UIApplication.openSettingsURLString)!, options: [:], completionHandler: nil)
+      guard let settingsURL = URL(string: UIApplication.openSettingsURLString) else { return }
+      UIApplication.shared.open(settingsURL, options: [:], completionHandler: nil)
     }
 
     alertController.addAction(cancelAction)
@@ -341,6 +363,12 @@ extension ViewController {
   }
 
 
+  /// Height of the bottom sheet when collapsed. The embedded controller is always present once the
+  /// view has loaded; the fallback matches its default so a missing one cannot crash a pan.
+  private var collapsedBottomSheetHeight: CGFloat {
+    return inferenceViewController?.collapsedHeight ?? 60.0
+  }
+
   /** Change whether bottom sheet should be in expanded or collapsed state.
    */
   private func changeBottomViewState() {
@@ -403,7 +431,7 @@ extension ViewController {
   private func translateBottomSheet(withVerticalTranslation verticalTranslation: CGFloat) {
 
     let bottomSpace = initialBottomSpace - verticalTranslation
-    guard bottomSpace <= 0.0 && bottomSpace >= inferenceViewController!.collapsedHeight - bottomSheetView.bounds.size.height else {
+    guard bottomSpace <= 0.0 && bottomSpace >= collapsedBottomSheetHeight - bottomSheetView.bounds.size.height else {
       return
     }
     setBottomSheetLayout(withBottomSpace: bottomSpace)
@@ -432,13 +460,13 @@ extension ViewController {
       height = bottomSheetView.bounds.size.height
     }
     else {
-      height = inferenceViewController!.collapsedHeight
+      height = collapsedBottomSheetHeight
     }
 
     let currentHeight = bottomSheetView.bounds.size.height + bottomSpace
 
     if currentHeight - height <= collapseTransitionThreshold {
-      bottomSpace = inferenceViewController!.collapsedHeight - bottomSheetView.bounds.size.height
+      bottomSpace = collapsedBottomSheetHeight - bottomSheetView.bounds.size.height
     }
     else if currentHeight - height >= expandTransitionThreshold {
       bottomSpace = 0.0

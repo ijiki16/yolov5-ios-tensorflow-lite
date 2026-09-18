@@ -152,7 +152,9 @@ extension InferenceViewController: UITableViewDelegate, UITableViewDataSource {
 
   func tableView(_ tableView: UITableView, cellForRowAt indexPath: IndexPath) -> UITableViewCell {
 
-    let cell = tableView.dequeueReusableCell(withIdentifier: "INFO_CELL") as! InfoCell
+    guard let cell = tableView.dequeueReusableCell(withIdentifier: "INFO_CELL") as? InfoCell else {
+      return UITableViewCell()
+    }
 
     guard let inferenceSection = InferenceSections(rawValue: indexPath.section) else {
       return cell

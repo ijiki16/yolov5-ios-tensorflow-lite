@@ -32,8 +32,11 @@ class InferenceViewController: UIViewController {
 
   private enum InferenceInfo: Int, CaseIterable {
     case Resolution
-    case Crop
+    case ModelInput
+    case Preprocess
     case InferenceTime
+    case Postprocess
+    case FPS
 
     func displayString() -> String {
 
@@ -42,10 +45,16 @@ class InferenceViewController: UIViewController {
       switch self {
       case .Resolution:
         toReturn = "Resolution"
-      case .Crop:
-        toReturn = "Crop"
+      case .ModelInput:
+        toReturn = "Model Input"
+      case .Preprocess:
+        toReturn = "Preprocess"
       case .InferenceTime:
         toReturn = "Inference Time"
+      case .Postprocess:
+        toReturn = "Postprocess"
+      case .FPS:
+        toReturn = "Detection FPS"
 
       }
       return toReturn
@@ -70,6 +79,11 @@ class InferenceViewController: UIViewController {
 
   // MARK: Instance Variables
   var inferenceTime: Double = 0
+  var preprocessTime: Double = 0
+  var postprocessTime: Double = 0
+  var detectionFPS: Double = 0
+  /// "GPU" or "CPU", depending on where the model is currently running.
+  var backendName: String = ""
   var wantedInputWidth: Int = 0
   var wantedInputHeight: Int = 0
   var resolution: CGSize = CGSize.zero
@@ -195,11 +209,17 @@ extension InferenceViewController: UITableViewDelegate, UITableViewDataSource {
     switch inferenceInfo {
     case .Resolution:
       info = "\(Int(resolution.width))x\(Int(resolution.height))"
-    case .Crop:
-      info = "\(wantedInputWidth)x\(wantedInputHeight)"
+    case .ModelInput:
+      info = backendName.isEmpty ? "\(wantedInputWidth)x\(wantedInputHeight)"
+                                 : "\(wantedInputWidth)x\(wantedInputHeight) (\(backendName))"
+    case .Preprocess:
+      info = String(format: "%.2fms", preprocessTime)
     case .InferenceTime:
-
       info = String(format: "%.2fms", inferenceTime)
+    case .Postprocess:
+      info = String(format: "%.2fms", postprocessTime)
+    case .FPS:
+      info = String(format: "%.1f", detectionFPS)
     }
 
     return(fieldName, info)

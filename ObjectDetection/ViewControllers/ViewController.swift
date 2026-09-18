@@ -50,6 +50,9 @@ class ViewController: UIViewController {
   private let inferenceSlot = DispatchSemaphore(value: 1)
   // Only accessed from `didOutput`, which is always called on the camera's single sample buffer queue.
   private var previousInferenceStartTime: CFTimeInterval = 0
+  // Smoothed detections per second, updated on the main thread each time a result arrives.
+  private var detectionFPS: Double = 0
+  private var previousResultTime: CFTimeInterval = 0
 
   // MARK: Controllers that manage functionality
   private lazy var cameraFeedManager = CameraFeedManager(previewView: previewView)
@@ -282,12 +285,26 @@ extension ViewController: CameraFeedManagerDelegate {
         // Display results by handing off to the InferenceViewController
         self.inferenceViewController?.resolution = CGSize(width: width, height: height)
         self.inferenceViewController?.inferenceTime = displayResult.inferenceTime
+        self.inferenceViewController?.preprocessTime = displayResult.preprocessTime
+        self.inferenceViewController?.postprocessTime = displayResult.postprocessTime
+        self.inferenceViewController?.backendName = displayResult.isUsingGPU ? "GPU" : "CPU"
+        self.inferenceViewController?.detectionFPS = self.updatedDetectionFPS()
         self.inferenceViewController?.tableView.reloadData()
 
         // Draws the bounding boxes and displays class names and confidence scores.
         self.drawAfterPerformingCalculations(onInferences: displayResult.inferences, withImageSize: CGSize(width: CGFloat(width), height: CGFloat(height)))
       }
     }
+  }
+
+  /// Exponentially smoothed rate at which results arrive, in detections per second.
+  private func updatedDetectionFPS() -> Double {
+    let now = CACurrentMediaTime()
+    defer { previousResultTime = now }
+    guard previousResultTime > 0, now > previousResultTime else { return detectionFPS }
+    let instantaneous = 1 / (now - previousResultTime)
+    detectionFPS = detectionFPS == 0 ? instantaneous : detectionFPS * 0.8 + instantaneous * 0.2
+    return detectionFPS
   }
 
   /**

@@ -19,7 +19,14 @@ import Accelerate
 
 /// Stores results for a particular frame that was successfully run through the `Interpreter`.
 struct InferenceResult {
+    /// Time spent in `Interpreter.invoke()`, in milliseconds.
     let inferenceTime: Double
+    /// Time spent resizing/converting the frame and filling the input tensor, in milliseconds.
+    let preprocessTime: Double
+    /// Time spent reading the output tensor back, decoding it and running NMS, in milliseconds.
+    let postprocessTime: Double
+    /// Whether this frame ran on the GPU (Metal delegate) rather than the CPU.
+    let isUsingGPU: Bool
     let inferences: [Inference]
 }
 
@@ -179,69 +186,87 @@ class ModelDataHandler: NSObject {
     /// This class handles all data preprocessing and makes calls to run inference on a given frame
     /// through the `Interpreter`. It then formats the inferences obtained and returns the top N
     /// results for a successful inference.
+    ///
+    /// Each stage is wrapped in a signpost interval (visible in Instruments' Points of Interest track)
+    /// and timed, so the time per stage can be shown in the UI.
     func runModel(onFrame pixelBuffer: CVPixelBuffer) -> InferenceResult? {
         let imageWidth = CVPixelBufferGetWidth(pixelBuffer)
         let imageHeight = CVPixelBufferGetHeight(pixelBuffer)
-        
-        // Scales the image to fit the model input without distorting it, padding the remainder.
         let inputSize = CGSize(width: inputWidth, height: inputHeight)
-        guard let (scaledPixelBuffer, letterbox) = pixelBuffer.letterboxed(to: inputSize) else {
-            Log.error("Failed to resize the frame; only 32BGRA and 32ARGB pixel buffers are supported.")
-            return nil
-        }
         
-        let interval: TimeInterval
-        let outputResult: Tensor
-
-        do {
-            let inputTensor = try interpreter.input(at: 0)
-            
-            // Remove the alpha component from the image buffer to get the RGB data.
-            guard let rgbData = rgbDataFromBuffer(
-                scaledPixelBuffer,
-                byteCount: batchSize * inputWidth * inputHeight * inputChannels,
-                isModelQuantized: inputTensor.dataType == .uInt8
-            ) else {
-                Log.error("Failed to convert the image buffer to RGB data.")
+        // Stage 1: fit the frame into the model input, convert it to RGB floats and fill the input tensor.
+        let (preparedLetterbox, preprocessTime) = Log.timed("Preprocess") { () -> Letterbox? in
+            // Scales the image to fit the model input without distorting it, padding the remainder.
+            guard let (scaledPixelBuffer, letterbox) = pixelBuffer.letterboxed(to: inputSize) else {
+                Log.error("Failed to resize the frame; only 32BGRA and 32ARGB pixel buffers are supported.")
+                return nil
+            }
+            do {
+                let inputTensor = try interpreter.input(at: 0)
+                
+                // Remove the alpha component from the image buffer to get the RGB data.
+                guard let rgbData = rgbDataFromBuffer(
+                    scaledPixelBuffer,
+                    byteCount: batchSize * inputWidth * inputHeight * inputChannels,
+                    isModelQuantized: inputTensor.dataType == .uInt8
+                ) else {
+                    Log.error("Failed to convert the image buffer to RGB data.")
+                    return nil
+                }
+                
+                // Copy the RGB data to the input `Tensor`.
+                try interpreter.copy(rgbData, toInputAt: 0)
+                return letterbox
+            } catch let error {
+                Log.error("Failed to prepare the input tensor with error: \(error.localizedDescription)")
+                return nil
+            }
+        }
+        guard let letterbox = preparedLetterbox else { return nil }
+        
+        // Stage 2: run inference by invoking the `Interpreter`.
+        let (invokeSucceeded, inferenceTime) = Log.timed("Inference") { () -> Bool in
+            do {
+                try interpreter.invoke()
+                return true
+            } catch let error {
+                Log.error("Failed to invoke the interpreter with error: \(error.localizedDescription)")
+                return false
+            }
+        }
+        guard invokeSucceeded else { return nil }
+        
+        // Stage 3: read the output back, decode it into boxes and suppress overlaps.
+        let (decodedInferences, postprocessTime) = Log.timed("Postprocess") { () -> [Inference]? in
+            let outputData: Data
+            do {
+                outputData = try interpreter.output(at: 0).data
+            } catch let error {
+                Log.error("Failed to read the output tensor with error: \(error.localizedDescription)")
                 return nil
             }
             
-            // Copy the RGB data to the input `Tensor`.
-            try interpreter.copy(rgbData, toInputAt: 0)
+            // Decode straight from the tensor's bytes to avoid copying ~2M floats into an array.
+            let expectedByteCount = outputRows * outputColumns * MemoryLayout<Float>.stride
+            guard outputData.count >= expectedByteCount else {
+                Log.error("Unexpected output tensor size.")
+                return nil
+            }
+            let nmsPredictions = outputData.withUnsafeBytes { rawBuffer in
+                PrePostProcessor.outputsToNMSPredictions(
+                    outputs: rawBuffer.bindMemory(to: Float.self), rows: outputRows, columns: outputColumns,
+                    inputSize: inputSize, letterbox: letterbox,
+                    imageWidth: CGFloat(imageWidth), imageHeight: CGFloat(imageHeight))
+            }
             
-            // Run inference by invoking the `Interpreter`.
-            let startTime = CACurrentMediaTime()
-            try interpreter.invoke()
-            interval = (CACurrentMediaTime() - startTime) * 1000
-            
-            outputResult = try interpreter.output(at: 0)
-        } catch let error {
-            Log.error("Failed to invoke the interpreter with error: \(error.localizedDescription)")
-            return nil
+            return nmsPredictions.map { prediction in
+                Inference(confidence: prediction.score, className: labels[prediction.classIndex], rect: prediction.rect, displayColor: colorForClass(withIndex: prediction.classIndex + 1))
+            }
         }
+        guard let inferences = decodedInferences else { return nil }
         
-        // Decode straight from the tensor's bytes to avoid copying ~2M floats into an array.
-        let outputData = outputResult.data
-        let expectedByteCount = outputRows * outputColumns * MemoryLayout<Float>.stride
-        guard outputData.count >= expectedByteCount else {
-            Log.error("Unexpected output tensor size.")
-            return nil
-        }
-        let nmsPredictions = outputData.withUnsafeBytes { rawBuffer in
-            PrePostProcessor.outputsToNMSPredictions(
-                outputs: rawBuffer.bindMemory(to: Float.self), rows: outputRows, columns: outputColumns,
-                inputSize: inputSize, letterbox: letterbox,
-                imageWidth: CGFloat(imageWidth), imageHeight: CGFloat(imageHeight))
-        }
-
-        var inference: [Inference] = []
-        for prediction in nmsPredictions {
-            let pred = Inference(confidence: prediction.score, className: labels[prediction.classIndex], rect: prediction.rect, displayColor: colorForClass(withIndex: prediction.classIndex + 1))
-            inference.append(pred)
-        }
-        let result = InferenceResult(inferenceTime: interval, inferences: inference)
-
-        return result
+        return InferenceResult(inferenceTime: inferenceTime, preprocessTime: preprocessTime,
+                               postprocessTime: postprocessTime, isUsingGPU: isUsingGPU, inferences: inferences)
     }
     
     /// Loads the labels from the labels file and stores them in the `labels` property.

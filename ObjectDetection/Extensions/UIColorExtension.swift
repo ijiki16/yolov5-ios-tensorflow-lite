@@ -32,8 +32,12 @@ extension UIColor {
       return nil
     }
 
-    // Returns the color comprised by percentage r g b values of the original color.
-    let colorToReturn = UIColor(displayP3Red: min(red + percent / 100.0, 1.0), green: min(green + percent / 100.0, 1.0), blue: min(blue + percent / 100.0, 1.0), alpha: 1.0)
+    // Returns the color comprised by percentage r g b values of the original color. `percent` can be
+    // negative (darkening), so each component is clamped to 0...1; UIKit warns about values outside it.
+    func adjusted(_ component: CGFloat) -> CGFloat {
+      return min(max(component + percent / 100.0, 0.0), 1.0)
+    }
+    let colorToReturn = UIColor(displayP3Red: adjusted(red), green: adjusted(green), blue: adjusted(blue), alpha: 1.0)
 
     return colorToReturn
   }

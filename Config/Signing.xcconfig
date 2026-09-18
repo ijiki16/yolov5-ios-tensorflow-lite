@@ -1,0 +1,9 @@
+// Signing settings shared by every build configuration.
+//
+// Do not put your own team or bundle identifier here. Copy Local.xcconfig.example to
+// Local.xcconfig (which is git-ignored) and set your values there.
+
+DEVELOPMENT_TEAM =
+PRODUCT_BUNDLE_IDENTIFIER = org.tensorflow.ObjectDetection
+
+#include? "Local.xcconfig"

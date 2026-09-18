@@ -1,0 +1,8 @@
+// Copy this file to Local.xcconfig and fill in your own values. Local.xcconfig is git-ignored,
+// so your signing setup never ends up in a commit.
+
+// Your Apple Developer team ID (Xcode > Settings > Accounts, or developer.apple.com > Membership).
+DEVELOPMENT_TEAM = ABCDE12345
+
+// A bundle identifier that is unique to you.
+PRODUCT_BUNDLE_IDENTIFIER = com.example.ObjectDetection
